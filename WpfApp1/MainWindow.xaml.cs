@@ -51,6 +51,8 @@ public partial class MainWindow : Window
 
     static readonly object browserEnvironmentLock = new();
     static Task<CoreWebView2Environment>? browserEnvironmentTask;
+    static readonly string browserUserDataFolder = System.IO.Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Trixter", "WebView2");
     static readonly SemaphoreSlim uBlockImportGate = new(1, 1);
     static bool uBlockImportAttempted;
     const string UBlockExtensionId = "cjpalhdlnbpafiamejdnhcphjbkeiagm";
@@ -131,10 +133,16 @@ public partial class MainWindow : Window
     Grid rootGrid = null!;
     List<AddressSuggestion> currentSuggestions = new();
     bool settingAddressText;
+    readonly TaskCompletionSource<bool> initialTabReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    BrowserTab? tabDragSource;
+    Point tabDragStart;
+    bool tabDragStarted;
 
-    public MainWindow() : this(false) { }
+    public MainWindow() : this(false, null) { }
 
-    MainWindow(bool privateMode)
+    MainWindow(bool privateMode) : this(privateMode, null) { }
+
+    MainWindow(bool privateMode, string? initialAddress)
     {
         InitializeComponent();
         maximizeIcon = (Path)FindName("MaximizeIcon");
@@ -161,6 +169,8 @@ public partial class MainWindow : Window
             Closed += (_, _) => _ = DeletePrivateProfileWhenReleased(privateProfilePath);
         }
         rootGrid = (Grid)Content;
+        PreviewMouseMove += TabDrag_MouseMove;
+        PreviewMouseLeftButtonUp += TabDrag_MouseUp;
         BuildSearchEngineIcons();
         FitToWorkArea();
         LoadPreferences();
@@ -178,14 +188,24 @@ public partial class MainWindow : Window
                     var options = new CoreWebView2EnvironmentOptions { AreBrowserExtensionsEnabled = true };
                     privateEnvironment = await CoreWebView2Environment.CreateAsync(null, privateProfilePath, options);
                 }
-                catch (Exception ex) { MessageBox.Show("Could not start the private browsing profile: " + ex.Message, "Trixter"); }
+                catch (Exception ex)
+                {
+                    ShowWebView2InitializationError(ex);
+                    initialTabReady.TrySetResult(false);
+                    return;
+                }
             }
             else
             {
                 try { browserEnvironment = await GetBrowserEnvironmentAsync(); }
-                catch (Exception ex) { MessageBox.Show("Could not start the browser profile: " + ex.Message, "Trixter"); }
+                catch (Exception ex)
+                {
+                    ShowWebView2InitializationError(ex);
+                    initialTabReady.TrySetResult(false);
+                    return;
+                }
             }
-            await AddTab();
+            initialTabReady.TrySetResult(await AddTab(initialAddress));
         };
         PreviewKeyDown += HandleShortcuts;
     }
@@ -193,7 +213,72 @@ public partial class MainWindow : Window
     static Task<CoreWebView2Environment> GetBrowserEnvironmentAsync()
     {
         lock (browserEnvironmentLock)
-            return browserEnvironmentTask ??= CoreWebView2Environment.CreateAsync(null, null, new CoreWebView2EnvironmentOptions { AreBrowserExtensionsEnabled = true });
+            return browserEnvironmentTask ??= CreateBrowserEnvironmentAsync();
+    }
+
+    static async Task<CoreWebView2Environment> CreateBrowserEnvironmentAsync()
+    {
+        System.IO.Directory.CreateDirectory(browserUserDataFolder);
+        return await CoreWebView2Environment.CreateAsync(
+            null,
+            browserUserDataFolder,
+            new CoreWebView2EnvironmentOptions { AreBrowserExtensionsEnabled = true });
+    }
+
+    static bool IsWebView2RuntimeMissing(Exception exception)
+    {
+        for (Exception? current = exception; current != null; current = current.InnerException)
+            if (current is WebView2RuntimeNotFoundException) return true;
+        return false;
+    }
+
+    void ShowWebView2InitializationError(Exception exception)
+    {
+        if (!IsWebView2RuntimeMissing(exception))
+        {
+            MessageBox.Show(
+                "Trixter couldn't start WebView2.\n\n" + exception.Message,
+                "Trixter Browser Startup",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            return;
+        }
+
+        const string downloadUrl = "https://developer.microsoft.com/microsoft-edge/webview2/";
+        var message = new TextBlock
+        {
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(20),
+            FontSize = 14
+        };
+        message.Inlines.Add(new System.Windows.Documents.Run(
+            "Trixter needs the Microsoft Edge WebView2 Evergreen Runtime to display web pages. It isn't installed on this computer.\n\n"));
+        var downloadLink = new System.Windows.Documents.Hyperlink(
+            new System.Windows.Documents.Run("Download the WebView2 Runtime from Microsoft"))
+        {
+            NavigateUri = new Uri(downloadUrl)
+        };
+        downloadLink.RequestNavigate += (_, args) =>
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(args.Uri.AbsoluteUri)
+            {
+                UseShellExecute = true
+            });
+            args.Handled = true;
+        };
+        message.Inlines.Add(downloadLink);
+
+        var dialog = new Window
+        {
+            Title = "WebView2 Runtime Required",
+            Owner = this,
+            Width = 470,
+            SizeToContent = SizeToContent.Height,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            ResizeMode = ResizeMode.NoResize,
+            Content = message
+        };
+        dialog.ShowDialog();
     }
 
     void FitToWorkArea()
@@ -377,7 +462,7 @@ public partial class MainWindow : Window
         }
     }
 
-    async Task AddTab(string? address = null)
+    async Task<bool> AddTab(string? address = null)
     {
         var tab = new BrowserTab();
         tab.Surface = new Border
@@ -393,6 +478,12 @@ public partial class MainWindow : Window
         DockPanel.SetDock(close, Dock.Right);
         tab.TitleButton = new Button { Content = "New tab", ToolTip = "Switch to tab", Style = (Style)FindResource("TabTitleButton"), Background = Brushes.Transparent, Foreground = ParseBrush(preferences.Theme == "Light" ? "#263142" : "#E7EAF0", Brushes.White), MinWidth = 105, Padding = new Thickness(12, 7, 5, 7) };
         tab.TitleButton.Click += (_, e) => { e.Handled = true; ActivateTab(tab); };
+        tab.TitleButton.PreviewMouseLeftButtonDown += (_, e) =>
+        {
+            tabDragSource = tab;
+            tabDragStart = tab.TitleButton.PointToScreen(e.GetPosition(tab.TitleButton));
+            tabDragStarted = false;
+        };
         header.Children.Add(close);
         header.Children.Add(tab.TitleButton);
         tab.Surface.Child = header;
@@ -444,7 +535,11 @@ public partial class MainWindow : Window
         };
 
         try { await tab.View.EnsureCoreWebView2Async(privateMode ? privateEnvironment : browserEnvironment); }
-        catch { MessageBox.Show("Install the Microsoft Edge WebView2 Runtime to browse with Trixter.", "Trixter", MessageBoxButton.OK, MessageBoxImage.Information); }
+        catch (Exception ex)
+        {
+            ShowWebView2InitializationError(ex);
+            return false;
+        }
         if (!privateMode && tab.View.CoreWebView2 != null)
         {
             try { await ImportOperaUBlockAsync(tab.View.CoreWebView2.Profile); }
@@ -453,6 +548,75 @@ public partial class MainWindow : Window
         ActivateTab(tab);
         var target = string.IsNullOrWhiteSpace(address) ? preferences.HomePage : address;
         if (!string.IsNullOrWhiteSpace(target)) Navigate(target, tab);
+        return tab.View.CoreWebView2 != null;
+    }
+
+    void TabDrag_MouseMove(object sender, MouseEventArgs e)
+    {
+        BrowserTab? draggedTab = tabDragSource;
+        if (draggedTab == null || e.LeftButton != MouseButtonState.Pressed || !tabs.Contains(draggedTab)) return;
+
+        Point screenPoint = PointToScreen(e.GetPosition(this));
+        if (!tabDragStarted)
+        {
+            if (Math.Abs(screenPoint.X - tabDragStart.X) < SystemParameters.MinimumHorizontalDragDistance &&
+                Math.Abs(screenPoint.Y - tabDragStart.Y) < SystemParameters.MinimumVerticalDragDistance) return;
+            tabDragStarted = true;
+        }
+
+        double tabBarBottom = TitleBar.PointToScreen(new Point(0, TitleBar.ActualHeight)).Y;
+        if (screenPoint.Y > tabBarBottom + 18)
+        {
+            tabDragSource = null;
+            _ = TearOffTabAsync(draggedTab);
+            e.Handled = true;
+            return;
+        }
+
+        int targetIndex = -1;
+        for (int i = 0; i < tabs.Count; i++)
+        {
+            var tab = tabs[i];
+            Point topLeft = tab.Surface.PointToScreen(new Point(0, 0));
+            if (new Rect(topLeft, tab.Surface.RenderSize).Contains(screenPoint))
+            {
+                targetIndex = i;
+                break;
+            }
+        }
+
+        int oldIndex = tabs.IndexOf(draggedTab);
+        if (targetIndex >= 0 && targetIndex != oldIndex)
+        {
+            tabs.RemoveAt(oldIndex);
+            tabs.Insert(Math.Min(targetIndex, tabs.Count), draggedTab);
+            TabStrip.Children.Remove(draggedTab.Surface);
+            TabStrip.Children.Insert(tabs.IndexOf(draggedTab), draggedTab.Surface);
+            e.Handled = true;
+        }
+    }
+
+    void TabDrag_MouseUp(object sender, MouseButtonEventArgs e)
+    {
+        tabDragSource = null;
+        tabDragStarted = false;
+    }
+
+    async Task TearOffTabAsync(BrowserTab tab)
+    {
+        if (!tabs.Contains(tab)) return;
+
+        var detachedWindow = new MainWindow(privateMode, tab.Url);
+        detachedWindow.Show();
+        bool detachedTabReady = await detachedWindow.initialTabReady.Task;
+        if (!detachedTabReady)
+        {
+            detachedWindow.Close();
+            return;
+        }
+
+        CloseTab(tab);
+        detachedWindow.Activate();
     }
 
     static async Task ImportOperaUBlockAsync(CoreWebView2Profile profile)
