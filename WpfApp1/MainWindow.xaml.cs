@@ -1,6 +1,7 @@
 using Microsoft.Web.WebView2.Wpf;
 using Microsoft.Web.WebView2.Core;
 using System.Text.Json;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -8,11 +9,46 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
 using System.Windows.Shell;
+using System.Windows.Interop;
 
 namespace WpfApp1;
 
 public partial class MainWindow : Window
 {
+    const int WmGetMinMaxInfo = 0x0024;
+    const uint MonitorDefaultToNearest = 2;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct NativePoint { public int X; public int Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct NativeRect { public int Left; public int Top; public int Right; public int Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct NativeMinMaxInfo
+    {
+        public NativePoint Reserved;
+        public NativePoint MaxSize;
+        public NativePoint MaxPosition;
+        public NativePoint MinTrackSize;
+        public NativePoint MaxTrackSize;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    struct NativeMonitorInfo
+    {
+        public int Size;
+        public NativeRect Monitor;
+        public NativeRect Work;
+        public uint Flags;
+    }
+
+    [DllImport("user32.dll")]
+    static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint flags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    static extern bool GetMonitorInfo(IntPtr monitor, ref NativeMonitorInfo info);
+
     static readonly object browserEnvironmentLock = new();
     static Task<CoreWebView2Environment>? browserEnvironmentTask;
     static readonly SemaphoreSlim uBlockImportGate = new(1, 1);
@@ -103,6 +139,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         maximizeIcon = (Path)FindName("MaximizeIcon");
         this.privateMode = privateMode;
+        SourceInitialized += (_, _) => HwndSource.FromHwnd(new WindowInteropHelper(this).Handle)?.AddHook(WindowMessageHook);
         StateChanged += (_, _) =>
         {
             var chrome = WindowChrome.GetWindowChrome(this);
@@ -1164,6 +1201,23 @@ public partial class MainWindow : Window
     }
 
     static bool IsColor(string value) { try { _ = ColorConverter.ConvertFromString(value); return true; } catch { return false; } }
+
+    IntPtr WindowMessageHook(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (message != WmGetMinMaxInfo) return IntPtr.Zero;
+        IntPtr monitor = MonitorFromWindow(hwnd, MonitorDefaultToNearest);
+        var monitorInfo = new NativeMonitorInfo { Size = Marshal.SizeOf<NativeMonitorInfo>() };
+        if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref monitorInfo)) return IntPtr.Zero;
+
+        var limits = Marshal.PtrToStructure<NativeMinMaxInfo>(lParam);
+        limits.MaxPosition.X = monitorInfo.Work.Left - monitorInfo.Monitor.Left;
+        limits.MaxPosition.Y = monitorInfo.Work.Top - monitorInfo.Monitor.Top;
+        limits.MaxSize.X = monitorInfo.Work.Right - monitorInfo.Work.Left;
+        limits.MaxSize.Y = monitorInfo.Work.Bottom - monitorInfo.Work.Top;
+        Marshal.StructureToPtr(limits, lParam, false);
+        handled = true;
+        return IntPtr.Zero;
+    }
 
     void Minimize_Click(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
     void Maximize_Click(object sender, RoutedEventArgs e) => WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
