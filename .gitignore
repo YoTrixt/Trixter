@@ -178,6 +178,8 @@ DocProject/Help/html
 
 # Click-Once directory
 publish/
+.publish-verification/
+installer-output/
 
 # Publish Web Output
 *.[Pp]ublish.xml
