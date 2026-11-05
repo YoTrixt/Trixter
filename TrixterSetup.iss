@@ -1,5 +1,5 @@
 #define MyAppName "Trixter"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Trixter"
 #define MyAppExeName "Trixter.exe"
 
@@ -20,9 +20,9 @@ UninstallDisplayIcon={app}\Trixter.exe
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
-VersionInfoVersion=1.0.0.0
+VersionInfoVersion=1.1.0.0
 OutputDir=installer-output
-OutputBaseFilename=TrixterSetup-1.0.0-x64
+OutputBaseFilename=TrixterSetup-1.1.0-x64
 SetupLogging=yes
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
