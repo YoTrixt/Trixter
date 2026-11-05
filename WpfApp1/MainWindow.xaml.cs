@@ -10,6 +10,8 @@ using System.Windows.Media.Imaging;
 using System.Windows.Shapes;
 using System.Windows.Shell;
 using System.Windows.Interop;
+using WpfApp1.PasswordManager;
+using System.Windows.Controls.Primitives;
 
 namespace WpfApp1;
 
@@ -62,6 +64,7 @@ public partial class MainWindow : Window
         public string Title = "New tab";
         public string Url = "";
         public WebView2 View = new();
+        public MainWindow Owner = null!;
         public Button TitleButton = null!;
         public Border Surface = null!;
     }
@@ -92,7 +95,8 @@ public partial class MainWindow : Window
         public bool IsSearch { get; set; }
         public bool IsRecentSearch { get; set; }
     }
-
+    private VaultService passwordVault = new();
+    private Popup? passwordAccountPopup;
     sealed class Preferences
     {
         public string Accent { get; set; } = "#B6F36A";
@@ -142,7 +146,8 @@ public partial class MainWindow : Window
 
     MainWindow(bool privateMode) : this(privateMode, null) { }
 
-    MainWindow(bool privateMode, string? initialAddress)
+    MainWindow(bool privateMode, string? initialAddress, bool emptyWindow = false,
+        CoreWebView2Environment? sharedPrivateEnvironment = null, string? sharedPrivateProfilePath = null)
     {
         InitializeComponent();
         maximizeIcon = (Path)FindName("MaximizeIcon");
@@ -165,14 +170,27 @@ public partial class MainWindow : Window
             Title = "Trixter — Incognito";
             BrandLabel.Text = "TRIXTER  ·  INCOGNITO";
             BrandLabel.Foreground = new SolidColorBrush(Color.FromRgb(190, 164, 255));
-            privateProfilePath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "Trixter-InPrivate-" + Guid.NewGuid().ToString("N"));
-            Closed += (_, _) => _ = DeletePrivateProfileWhenReleased(privateProfilePath);
+            privateProfilePath = sharedPrivateProfilePath ?? System.IO.Path.Combine(System.IO.Path.GetTempPath(), "Trixter-InPrivate-" + Guid.NewGuid().ToString("N"));
+            Closed += (_, _) =>
+            {
+                // Delete the shared incognito profile only after its final window closes.
+                bool anotherWindowUsesProfile = Application.Current.Windows
+                    .OfType<MainWindow>()
+                    .Any(window => window != this && window.privateMode &&
+                        string.Equals(window.privateProfilePath, privateProfilePath, StringComparison.OrdinalIgnoreCase));
+
+                if (!anotherWindowUsesProfile)
+                    _ = DeletePrivateProfileWhenReleased(privateProfilePath);
+            };
         }
         rootGrid = (Grid)Content;
         PreviewMouseMove += TabDrag_MouseMove;
         PreviewMouseLeftButtonUp += TabDrag_MouseUp;
         BuildSearchEngineIcons();
         FitToWorkArea();
+        WindowState = WindowState.Maximized;
+        maximizeIcon.Data = Geometry.Parse(
+            "M 5,5 L 16,5 L 16,16 L 5,16 Z M 2,12 L 2,2 L 12,2");
         LoadPreferences();
         SearchEngineBox.SelectedItem = SearchEngineBox.Items.OfType<ComboBoxItem>().FirstOrDefault(x => x.Tag?.ToString() == preferences.SearchEngine)
             ?? SearchEngineBox.Items.OfType<ComboBoxItem>().First();
@@ -185,8 +203,9 @@ public partial class MainWindow : Window
             {
                 try
                 {
-                    var options = new CoreWebView2EnvironmentOptions { AreBrowserExtensionsEnabled = true };
-                    privateEnvironment = await CoreWebView2Environment.CreateAsync(null, privateProfilePath, options);
+                    privateEnvironment = sharedPrivateEnvironment ?? await CoreWebView2Environment.CreateAsync(
+                        null, privateProfilePath,
+                        new CoreWebView2EnvironmentOptions { AreBrowserExtensionsEnabled = true });
                 }
                 catch (Exception ex)
                 {
@@ -205,7 +224,21 @@ public partial class MainWindow : Window
                     return;
                 }
             }
+            if (emptyWindow)
+            {
+                initialTabReady.TrySetResult(true);
+                return;
+            }
+
             initialTabReady.TrySetResult(await AddTab(initialAddress));
+        };
+        PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Escape && passwordAccountPopup?.IsOpen == true)
+            {
+                passwordAccountPopup.IsOpen = false;
+                e.Handled = true;
+            }
         };
         PreviewKeyDown += HandleShortcuts;
     }
@@ -230,6 +263,249 @@ public partial class MainWindow : Window
         for (Exception? current = exception; current != null; current = current.InnerException)
             if (current is WebView2RuntimeNotFoundException) return true;
         return false;
+    }
+
+    static ControlTemplate CreateSettingsButtonTemplate()
+    {
+        var template = new ControlTemplate(typeof(Button));
+
+        var border = new FrameworkElementFactory(typeof(Border));
+        border.Name = "ButtonBorder";
+
+        border.SetValue(
+            Border.BackgroundProperty,
+            new TemplateBindingExtension(Button.BackgroundProperty));
+
+        border.SetValue(
+            Border.BorderBrushProperty,
+            new TemplateBindingExtension(Button.BorderBrushProperty));
+
+        border.SetValue(
+            Border.BorderThicknessProperty,
+            new TemplateBindingExtension(Button.BorderThicknessProperty));
+
+        border.SetValue(
+            Border.CornerRadiusProperty,
+            new CornerRadius(7));
+
+        border.SetValue(
+            Border.PaddingProperty,
+            new TemplateBindingExtension(Button.PaddingProperty));
+
+        var content = new FrameworkElementFactory(typeof(ContentPresenter));
+
+        content.SetValue(
+            ContentPresenter.HorizontalAlignmentProperty,
+            HorizontalAlignment.Center);
+
+        content.SetValue(
+            ContentPresenter.VerticalAlignmentProperty,
+            VerticalAlignment.Center);
+
+        content.SetValue(
+            ContentPresenter.ContentProperty,
+            new TemplateBindingExtension(Button.ContentProperty));
+
+        border.AppendChild(content);
+        template.VisualTree = border;
+
+        var hover = new Trigger
+        {
+            Property = Button.IsMouseOverProperty,
+            Value = true
+        };
+
+        hover.Setters.Add(new Setter(UIElement.OpacityProperty, 0.85));
+
+        var pressed = new Trigger
+        {
+            Property = Button.IsPressedProperty,
+            Value = true
+        };
+
+        pressed.Setters.Add(new Setter(UIElement.OpacityProperty, 0.7));
+
+        template.Triggers.Add(hover);
+        template.Triggers.Add(pressed);
+
+        return template;
+    }
+
+    void ShowPasswordAccountMenu(BrowserTab tab, List<VaultEntry> accounts)
+    {
+        if (privateMode || accounts.Count == 0)
+            return;
+
+        if (passwordAccountPopup?.IsOpen == true)
+            return; 
+
+        bool light = preferences.Theme == "Light";
+
+        var background = new SolidColorBrush(
+            light ? Color.FromRgb(255, 255, 255) : Color.FromRgb(30, 34, 43));
+
+        var foreground = new SolidColorBrush(
+            light ? Color.FromRgb(35, 42, 53) : Color.FromRgb(239, 242, 247));
+
+        var muted = new SolidColorBrush(
+            light ? Color.FromRgb(110, 120, 135) : Color.FromRgb(155, 165, 180));
+
+        var accent = ParseBrush(preferences.Accent, Brushes.LightGreen);
+
+        var border = new Border
+        {
+            Background = background,
+            BorderBrush = new SolidColorBrush(
+                light ? Color.FromRgb(220, 225, 233) : Color.FromRgb(57, 65, 78)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(12),
+            Padding = new Thickness(8),
+            Width = 290,
+            Effect = new System.Windows.Media.Effects.DropShadowEffect
+            {
+                BlurRadius = 18,
+                ShadowDepth = 4,
+                Opacity = 0.25
+            }
+        };
+
+        var panel = new StackPanel();
+        border.Child = panel;
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = "TRIXTER PASSWORDS",
+            FontSize = 10,
+            FontWeight = FontWeights.Bold,
+            Foreground = muted,
+            Margin = new Thickness(10, 7, 10, 10)
+        });
+
+        var popup = new Popup
+        {
+            Child = border,
+            PlacementTarget = tab.View,
+            Placement = PlacementMode.MousePoint,
+            AllowsTransparency = true,
+            StaysOpen = true
+        };
+        passwordAccountPopup = popup;
+
+        foreach (var account in accounts)
+        {
+            var button = new Button
+            {
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Padding = new Thickness(10, 9, 10, 9),
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                Cursor = Cursors.Hand
+            };
+
+            var accountPanel = new StackPanel();
+
+            accountPanel.Children.Add(new TextBlock
+            {
+                Text = account.Username,
+                FontSize = 13,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = foreground
+            });
+
+            accountPanel.Children.Add(new TextBlock
+            {
+                Text = account.Website,
+                FontSize = 10,
+                Foreground = muted,
+                Margin = new Thickness(0, 3, 0, 0)
+            });
+
+            button.Content = accountPanel;
+
+            button.MouseEnter += (_, _) =>
+            {
+                button.Background = new SolidColorBrush(
+                    light ? Color.FromRgb(238, 243, 249) : Color.FromRgb(48, 56, 69));
+            };
+
+            button.MouseLeave += (_, _) =>
+            {
+                button.Background = Brushes.Transparent;
+            };
+
+            button.Click += async (_, _) =>
+            {
+                popup.IsOpen = false;
+                if (!Uri.TryCreate(tab.Url, UriKind.Absolute, out var currentUri))
+                    return;
+
+                string currentOrigin =
+                    currentUri.GetLeftPart(UriPartial.Authority);
+
+                if (!string.Equals(
+                    currentOrigin,
+                    account.Website.TrimEnd('/'),
+                    StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                string usernameJson =
+                    JsonSerializer.Serialize(account.Username);
+
+                string passwordJson =
+                    JsonSerializer.Serialize(account.Password);
+
+                string script = $$"""
+                (() => {
+                    const password = document.querySelector(
+                        'input[type="password"]'
+                    );
+
+                    if (!password) return;
+
+                    const form = password.form || document;
+
+                    const username = Array.from(
+                        form.querySelectorAll('input')
+                    ).find(input =>
+                        input !== password &&
+                        (
+                            input.autocomplete === 'username' ||
+                            input.type === 'email' ||
+                            input.type === 'text'
+                        )
+                    );
+
+                    function fill(input, value) {
+                        const setter = Object.getOwnPropertyDescriptor(
+                            HTMLInputElement.prototype,
+                            'value'
+                        ).set;
+
+                        setter.call(input, value);
+
+                        input.dispatchEvent(
+                            new Event('input', { bubbles: true })
+                        );
+
+                        input.dispatchEvent(
+                            new Event('change', { bubbles: true })
+                        );
+                    }
+
+                    if (username)
+                        fill(username, {{usernameJson}});
+
+                    fill(password, {{passwordJson}});
+                })();
+                """;
+
+                await tab.View.CoreWebView2.ExecuteScriptAsync(script);
+            };
+
+            panel.Children.Add(button);
+        }
+
+        popup.IsOpen = true;
     }
 
     void ShowWebView2InitializationError(Exception exception)
@@ -268,7 +544,7 @@ public partial class MainWindow : Window
         };
         message.Inlines.Add(downloadLink);
 
-        var dialog = new Window
+        var dialog = new Window()
         {
             Title = "WebView2 Runtime Required",
             Owner = this,
@@ -329,9 +605,10 @@ public partial class MainWindow : Window
         Brush muted = new SolidColorBrush(light ? Color.FromRgb(105, 112, 123) : Color.FromRgb(146, 152, 165));
         Brush accent = ParseBrush(preferences.Accent, Brushes.LightGreen);
 
-        Background = new SolidColorBrush(background);
-        Resources["HoverSurface"] = new SolidColorBrush(light ? Color.FromRgb(225, 230, 237) : Color.FromRgb(48, 53, 64));
-        TitleBar.Background = Toolbar.Background = BookmarkBar.Background = new SolidColorBrush(surface);
+        Resources["HoverSurface"] = new SolidColorBrush(
+            light
+                ? Color.FromRgb(232, 236, 242)
+                : Color.FromRgb(39, 45, 56)); TitleBar.Background = Toolbar.Background = BookmarkBar.Background = new SolidColorBrush(surface);
         if (!string.IsNullOrWhiteSpace(preferences.StartPageBackground) && System.IO.File.Exists(preferences.StartPageBackground))
         {
             try
@@ -462,9 +739,8 @@ public partial class MainWindow : Window
         }
     }
 
-    async Task<bool> AddTab(string? address = null)
+    void CreateTabHeader(BrowserTab tab)
     {
-        var tab = new BrowserTab();
         tab.Surface = new Border
         {
             CornerRadius = new CornerRadius(8, 8, 0, 0),
@@ -472,11 +748,25 @@ public partial class MainWindow : Window
             Margin = new Thickness(2, 5, 2, 0),
             BorderThickness = new Thickness(0, 0, 0, 2)
         };
+
         var header = new DockPanel { LastChildFill = true };
-        var close = new Button { Content = "x", ToolTip = "Close tab", Style = (Style)FindResource("ChromeButton"), Padding = new Thickness(8, 6, 9, 6), FontSize = 12 };
+        var close = new Button
+        {
+            Content = "x", ToolTip = "Close tab",
+            Style = (Style)FindResource("ChromeButton"),
+            Padding = new Thickness(8, 6, 9, 6), FontSize = 12
+        };
         close.Click += (_, e) => { e.Handled = true; CloseTab(tab); };
         DockPanel.SetDock(close, Dock.Right);
-        tab.TitleButton = new Button { Content = "New tab", ToolTip = "Switch to tab", Style = (Style)FindResource("TabTitleButton"), Background = Brushes.Transparent, Foreground = ParseBrush(preferences.Theme == "Light" ? "#263142" : "#E7EAF0", Brushes.White), MinWidth = 105, Padding = new Thickness(12, 7, 5, 7) };
+
+        tab.TitleButton = new Button
+        {
+            Content = tab.Title, ToolTip = tab.Title,
+            Style = (Style)FindResource("TabTitleButton"),
+            Background = Brushes.Transparent,
+            Foreground = ParseBrush(preferences.Theme == "Light" ? "#263142" : "#E7EAF0", Brushes.White),
+            MinWidth = 105, Padding = new Thickness(12, 7, 5, 7)
+        };
         tab.TitleButton.Click += (_, e) => { e.Handled = true; ActivateTab(tab); };
         tab.TitleButton.PreviewMouseLeftButtonDown += (_, e) =>
         {
@@ -484,9 +774,16 @@ public partial class MainWindow : Window
             tabDragStart = tab.TitleButton.PointToScreen(e.GetPosition(tab.TitleButton));
             tabDragStarted = false;
         };
+
         header.Children.Add(close);
         header.Children.Add(tab.TitleButton);
         tab.Surface.Child = header;
+    }
+
+    async Task<bool> AddTab(string? address = null)
+    {
+        var tab = new BrowserTab { Owner = this };
+        CreateTabHeader(tab);
         tabs.Add(tab);
         TabStrip.Children.Add(tab.Surface);
 
@@ -495,7 +792,7 @@ public partial class MainWindow : Window
         tab.View.NavigationStarting += (_, e) =>
         {
             tab.Url = e.Uri;
-            if (tab == activeTab) SetAddressText(e.Uri);
+            if (tab == tab.Owner.activeTab) tab.Owner.SetAddressText(e.Uri);
         };
         tab.View.NavigationCompleted += (_, _) =>
         {
@@ -504,15 +801,15 @@ public partial class MainWindow : Window
             tab.TitleButton.ToolTip = tab.Title;
             if (!string.IsNullOrWhiteSpace(tab.Url))
             {
-                if (!privateMode)
+                if (!tab.Owner.privateMode)
                 {
-                    preferences.RecentPages.RemoveAll(x => x.Url == tab.Url);
-                    preferences.RecentPages.Insert(0, new RecentPage { Title = tab.Title, Url = tab.Url });
-                    if (preferences.RecentPages.Count > 40) preferences.RecentPages.RemoveRange(40, preferences.RecentPages.Count - 40);
-                    SavePreferences();
+                    tab.Owner.preferences.RecentPages.RemoveAll(x => x.Url == tab.Url);
+                    tab.Owner.preferences.RecentPages.Insert(0, new RecentPage { Title = tab.Title, Url = tab.Url });
+                    if (tab.Owner.preferences.RecentPages.Count > 40) tab.Owner.preferences.RecentPages.RemoveRange(40, tab.Owner.preferences.RecentPages.Count - 40);
+                    tab.Owner.SavePreferences();
                 }
             }
-            if (tab == activeTab) UpdateBookmarkButton();
+            if (tab == tab.Owner.activeTab) tab.Owner.UpdateBookmarkButton();
         };
         tab.View.CoreWebView2InitializationCompleted += (_, e) =>
         {
@@ -521,26 +818,130 @@ public partial class MainWindow : Window
                 CoreWebView2 core = tab.View.CoreWebView2;
                 core.WebMessageReceived += (_, message) =>
                 {
-                    if (message.WebMessageAsJson == "\"trixter:new-window\"") OpenBrowserWindow(false);
-                    else if (message.WebMessageAsJson == "\"trixter:incognito-window\"") OpenBrowserWindow(true);
-                    else if (message.WebMessageAsJson == "\"trixter:history\"") History_Click(this, new RoutedEventArgs());
+                    string receivedMessage = message.TryGetWebMessageAsString();
+
+                    var owner = tab.Owner;
+                    if (receivedMessage == "trixter:new-window")
+                        owner.OpenBrowserWindow(false);
+
+                    else if (receivedMessage == "trixter:incognito-window")
+                        owner.OpenBrowserWindow(true);
+
+                    else if (receivedMessage == "trixter:history")
+                        owner.History_Click(owner, new RoutedEventArgs());
+
+                    else if (receivedMessage == "trixter:login-form-detected" && !owner.privateMode)
+                    {
+                        if (!owner.passwordVault.IsUnlocked)
+                            return;
+
+                        // Verify that the message came from the current page's origin.
+                        if (!Uri.TryCreate(message.Source, UriKind.Absolute, out var sourceUri) ||
+                            !Uri.TryCreate(tab.Url, UriKind.Absolute, out var tabUri))
+                            return;
+
+                        string sourceOrigin = sourceUri.GetLeftPart(UriPartial.Authority);
+                        string tabOrigin = tabUri.GetLeftPart(UriPartial.Authority);
+
+                        if (!string.Equals(
+                            sourceOrigin,
+                            tabOrigin,
+                            StringComparison.OrdinalIgnoreCase))
+                            return;
+
+                        var accounts = owner.passwordVault.GetEntriesForWebsite(sourceOrigin);
+
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[Trixter Password Manager] Found {accounts.Count} saved account(s) for {sourceOrigin}");
+                    }
+                    else if (receivedMessage == "trixter:show-password-menu" && !owner.privateMode)
+                    {
+                        if (!owner.passwordVault.IsUnlocked)
+                            return;
+
+                        if (!Uri.TryCreate(message.Source, UriKind.Absolute, out var sourceUri) ||
+                            !Uri.TryCreate(tab.Url, UriKind.Absolute, out var tabUri))
+                            return;
+
+                        if (!string.Equals(
+                            sourceUri.GetLeftPart(UriPartial.Authority),
+                            tabUri.GetLeftPart(UriPartial.Authority),
+                            StringComparison.OrdinalIgnoreCase))
+                            return;
+
+                        var accounts = owner.passwordVault.GetEntriesForWebsite(tab.Url);
+
+                        owner.ShowPasswordAccountMenu(tab, accounts);
+                    }
                 };
-                _ = core.AddScriptToExecuteOnDocumentCreatedAsync("document.addEventListener('keydown',e=>{if(e.ctrlKey&&e.key.toLowerCase()==='n'){e.preventDefault();e.stopImmediatePropagation();window.chrome.webview.postMessage(e.shiftKey?'trixter:incognito-window':'trixter:new-window')}else if(e.ctrlKey&&e.key.toLowerCase()==='h'){e.preventDefault();e.stopImmediatePropagation();window.chrome.webview.postMessage('trixter:history')}},true);");
+                _ = core.AddScriptToExecuteOnDocumentCreatedAsync(
+                    """
+                    (() => {
+                        let lastPrompt = 0;
+
+                        document.addEventListener('focusin', (event) => {
+                            const target = event.target;
+
+                            if (!(target instanceof HTMLInputElement))
+                                return;
+
+                            const form = target.form;
+
+                            if (!form)
+                                return;
+
+                            const password = form.querySelector(
+                                'input[type="password"]'
+                            );
+
+                            if (!password)
+                                return;
+
+                            const fieldName = [
+                                target.name,
+                                target.id,
+                                target.autocomplete,
+                                target.getAttribute('aria-label')
+                            ].join(' ');
+
+                            const isUsername =
+                                target === password ||
+                                target.type === 'email' ||
+                                target.autocomplete === 'username' ||
+                                /email|user|login|account/i.test(fieldName);
+
+                            if (!isUsername)
+                                return;
+
+                            const now = Date.now();
+
+                            if (now - lastPrompt < 500)
+                                return;
+
+                            lastPrompt = now;
+
+                            window.chrome.webview.postMessage(
+                                'trixter:show-password-menu'
+                            );
+                        });
+                    })();
+                    """
+                );
                 core.NewWindowRequested += (_, request) =>
                 {
                     request.Handled = true;
-                    _ = AddTab(request.Uri);
+                    _ = tab.Owner.AddTab(request.Uri);
                 };
             }
         };
 
-        try { await tab.View.EnsureCoreWebView2Async(privateMode ? privateEnvironment : browserEnvironment); }
+        try { await tab.View.EnsureCoreWebView2Async(tab.Owner.privateMode ? tab.Owner.privateEnvironment : tab.Owner.browserEnvironment); }
         catch (Exception ex)
         {
             ShowWebView2InitializationError(ex);
             return false;
         }
-        if (!privateMode && tab.View.CoreWebView2 != null)
+        if (!tab.Owner.privateMode && tab.View.CoreWebView2 != null)
         {
             try { await ImportOperaUBlockAsync(tab.View.CoreWebView2.Profile); }
             catch (Exception ex) { MessageBox.Show("Trixter found uBlock Origin in Opera GX but could not load it.\n\n" + ex.Message, "Trixter Extensions", MessageBoxButton.OK, MessageBoxImage.Warning); }
@@ -606,16 +1007,45 @@ public partial class MainWindow : Window
     {
         if (!tabs.Contains(tab)) return;
 
-        var detachedWindow = new MainWindow(privateMode, tab.Url);
+        var detachedWindow = new MainWindow(
+            privateMode, null, emptyWindow: true,
+            sharedPrivateEnvironment: privateMode ? privateEnvironment : null,
+            sharedPrivateProfilePath: privateMode ? privateProfilePath : null);
+
+        detachedWindow.passwordVault = passwordVault;
         detachedWindow.Show();
-        bool detachedTabReady = await detachedWindow.initialTabReady.Task;
-        if (!detachedTabReady)
+        bool ready = await detachedWindow.initialTabReady.Task;
+        if (!ready)
         {
             detachedWindow.Close();
             return;
         }
 
-        CloseTab(tab);
+        int oldIndex = tabs.IndexOf(tab);
+        bool wasActive = tab == activeTab;
+
+        // Detach the existing WebView2 control. It is never recreated or navigated.
+        tabs.Remove(tab);
+        TabStrip.Children.Remove(tab.Surface);
+        BrowserHost.Children.Remove(tab.View);
+
+        tab.Owner = detachedWindow;
+        detachedWindow.CreateTabHeader(tab);
+        detachedWindow.tabs.Add(tab);
+        detachedWindow.TabStrip.Children.Add(tab.Surface);
+        detachedWindow.BrowserHost.Children.Add(tab.View);
+        detachedWindow.ActivateTab(tab);
+
+        if (tabs.Count == 0)
+        {
+            activeTab = null;
+            _ = AddTab();
+        }
+        else if (wasActive)
+        {
+            ActivateTab(tabs[Math.Min(oldIndex, tabs.Count - 1)]);
+        }
+
         detachedWindow.Activate();
     }
 
@@ -673,7 +1103,23 @@ public partial class MainWindow : Window
         tabs.RemoveAt(oldIndex);
         TabStrip.Children.Remove(tab.Surface);
         BrowserHost.Children.Remove(tab.View);
-        if (tabs.Count == 0) { activeTab = null; _ = AddTab(); return; }
+        if (tabs.Count == 0)
+        {
+            activeTab = null;
+
+            // Keep a blank start tab only when this is the last Trixter window.
+            bool anotherTrixterWindowIsOpen = Application.Current.Windows
+                .OfType<MainWindow>()
+                .Any(window => window != this);
+
+            if (anotherTrixterWindowIsOpen)
+                Close();
+            else
+                _ = AddTab();
+
+            return;
+        }
+
         if (wasActive) ActivateTab(tabs[Math.Min(oldIndex, tabs.Count - 1)]);
     }
 
@@ -1149,14 +1595,32 @@ public partial class MainWindow : Window
         var field = new SolidColorBrush(light ? Color.FromRgb(248, 249, 251) : Color.FromRgb(19, 23, 30));
         var outline = new SolidColorBrush(light ? Color.FromRgb(210, 216, 225) : Color.FromRgb(52, 60, 72));
         var accent = ParseBrush(preferences.Accent, Brushes.LightGreen);
-        var dialog = new Window { Title = "Settings", Owner = this, Width = 520, Height = 740, MinHeight = 600, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = bg, Foreground = ink, ResizeMode = ResizeMode.CanResizeWithGrip };
+        var dialog = new Window { Title = "Settings", Owner = this, Width = 800, Height = 740, MinHeight = 600, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = bg, Foreground = ink, ResizeMode = ResizeMode.CanResizeWithGrip };
+        var settingsButtonStyle = new Style(typeof(Button));
+
+        settingsButtonStyle.Setters.Add(
+            new Setter(Button.BackgroundProperty, Brushes.Transparent));
+
+        settingsButtonStyle.Setters.Add(
+            new Setter(Button.BorderThicknessProperty, new Thickness(0)));
+
+        settingsButtonStyle.Setters.Add(
+            new Setter(Button.FocusVisualStyleProperty, null));
+
+        settingsButtonStyle.Setters.Add(
+            new Setter(Button.TemplateProperty, CreateSettingsButtonTemplate()));
+
+        dialog.Resources.Add(typeof(Button), settingsButtonStyle);
         var layout = new Grid(); layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); layout.RowDefinitions.Add(new RowDefinition()); layout.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var heading = new StackPanel { Margin = new Thickness(26, 22, 26, 18) };
         heading.Children.Add(new TextBlock { Text = "Settings", FontSize = 25, FontWeight = FontWeights.SemiBold, Foreground = ink });
         heading.Children.Add(new TextBlock { Text = "Shape Trixter around the way you browse.", FontSize = 12, Foreground = muted, Margin = new Thickness(0, 4, 0, 0) });
         layout.Children.Add(heading);
 
-        var content = new StackPanel { Margin = new Thickness(22, 0, 22, 10) };
+        var appearanceContent = new StackPanel();
+        var startPageContent = new StackPanel();
+        var shortcutsContent = new StackPanel();
+        var passwordContent = new StackPanel();
         string selectedTheme = preferences.Theme;
         string selectedDensity = preferences.Density;
         var hex = new TextBox { Text = preferences.Accent, Padding = new Thickness(9), Background = field, Foreground = ink, BorderBrush = outline };
@@ -1257,11 +1721,1062 @@ public partial class MainWindow : Window
         var backgroundControls = new StackPanel { Orientation = Orientation.Horizontal };
         backgroundControls.Children.Add(chooseBackground); backgroundControls.Children.Add(clearBackground); backgroundControls.Children.Add(backgroundStatus);
 
-        content.Children.Add(SettingsCard("Appearance", "Theme and color choices", new UIElement[] { SettingLabel("COLOR MODE", muted), themeChoices, SettingLabel("ACCENT COLOR", muted), swatches, hex, new TextBlock { Text = "Drag on the wheel to pick a color", FontSize = 10, Foreground = muted, Margin = new Thickness(0, 6, 0, 3) }, wheel, SettingLabel("INTERFACE LAYOUT", muted), densityChoices }, card, outline, ink, muted));
-        content.Children.Add(SettingsCard("Start page", "Choose what appears when you open a new tab", new UIElement[] { shortcutCheck, bookmarkCheck, suggestionCheck, SettingLabel("BACKGROUND IMAGE", muted), backgroundControls, SettingLabel("Homepage (blank uses Trixter start page)", muted), home, SettingLabel("Search URL template (include {query})", muted), search }, card, outline, ink, muted));
-        content.Children.Add(SettingsCard("Shortcuts and bookmarks", "Add shortcuts from the start page. Right-click an item to remove it.", Array.Empty<UIElement>(), card, outline, ink, muted));
-        var scroll = new ScrollViewer { Content = content, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-        Grid.SetRow(scroll, 1); layout.Children.Add(scroll);
+        appearanceContent.Children.Add(SettingsCard(
+            "Appearance",
+            "Theme and color choices",
+            new UIElement[]
+            {
+                SettingLabel("COLOR MODE", muted),
+                themeChoices,
+                SettingLabel("ACCENT COLOR", muted),
+                swatches,
+                hex,
+                new TextBlock
+                {
+                    Text = "Drag on the wheel to pick a color",
+                    FontSize = 10,
+                    Foreground = muted,
+                    Margin = new Thickness(0, 6, 0, 3)
+                },
+                wheel,
+                SettingLabel("INTERFACE LAYOUT", muted),
+                densityChoices
+            }, card, outline, ink, muted));
+
+        startPageContent.Children.Add(SettingsCard(
+            "Start page",
+            "Choose what appears when you open a new tab",
+            new UIElement[]
+            {
+                shortcutCheck,
+                bookmarkCheck,
+                suggestionCheck,
+                SettingLabel("BACKGROUND IMAGE", muted),
+                backgroundControls,
+                SettingLabel("Homepage (blank uses Trixter start page)", muted),
+                home,
+                SettingLabel("Search URL template (include {query})", muted),
+                search
+            }, card, outline, ink, muted));
+
+        var savedLinksPanel = new StackPanel();
+
+        void EditSavedLink(string currentTitle, string currentUrl, Action<string, string> save)
+        {
+            var editDialog = new Window
+            {
+                Title = "Edit saved website",
+                Owner = dialog,
+                Width = 440,
+                Height = 260,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Background = bg,
+                Foreground = ink,
+                ResizeMode = ResizeMode.NoResize
+            };
+
+            var editPanel = new StackPanel { Margin = new Thickness(18) };
+
+            editPanel.Children.Add(new TextBlock
+            {
+                Text = "Name",
+                Foreground = ink,
+                Margin = new Thickness(0, 0, 0, 5)
+            });
+
+            var nameInput = new TextBox
+            {
+                Text = currentTitle,
+                Padding = new Thickness(8),
+                Margin = new Thickness(0, 0, 0, 14),
+                Background = field,
+                Foreground = ink,
+                BorderBrush = outline
+            };
+            editPanel.Children.Add(nameInput);
+
+            editPanel.Children.Add(new TextBlock
+            {
+                Text = "URL",
+                Foreground = ink,
+                Margin = new Thickness(0, 0, 0, 5)
+            });
+
+            var urlInput = new TextBox
+            {
+                Text = currentUrl,
+                Padding = new Thickness(8),
+                Margin = new Thickness(0, 0, 0, 14),
+                Background = field,
+                Foreground = ink,
+                BorderBrush = outline
+            };
+            editPanel.Children.Add(urlInput);
+
+            var saveButton = new Button
+            {
+                Content = "Save",
+                IsDefault = true,
+                Padding = new Thickness(12, 6, 12, 6),
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Background = accent,
+                Foreground = light ? Brushes.White : Brushes.Black,
+                BorderThickness = new Thickness(0),
+                Cursor = Cursors.Hand
+            };
+
+            saveButton.Click += (_, _) =>
+            {
+                if (string.IsNullOrWhiteSpace(nameInput.Text) ||
+                    string.IsNullOrWhiteSpace(urlInput.Text))
+                {
+                    MessageBox.Show(editDialog, "Both the name and URL are required.", "Trixter Settings",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                    return;
+                }
+
+                editDialog.DialogResult = true;
+            };
+
+            editPanel.Children.Add(saveButton);
+            editDialog.Content = editPanel;
+
+            if (editDialog.ShowDialog() == true)
+                save(nameInput.Text.Trim(), Resolve(urlInput.Text.Trim()));
+        }
+
+        Border CreateLinkRow(string title, string url, Action edit, Action remove)
+        {
+            var row = new DockPanel
+            {
+                LastChildFill = true,
+                Margin = new Thickness(0, 4, 0, 4)
+            };
+
+            var actions = new StackPanel
+            {
+                Orientation = Orientation.Horizontal
+            };
+
+            var editButton = new Button
+            {
+                Content = "Edit",
+                Padding = new Thickness(9, 5, 9, 5),
+                Margin = new Thickness(3),
+                Background = field,
+                Foreground = ink,
+                BorderThickness = new Thickness(0),
+                Cursor = Cursors.Hand
+            };
+            editButton.Click += (_, _) => edit();
+
+            var removeButton = new Button
+            {
+                Content = "Remove",
+                Padding = new Thickness(9, 5, 9, 5),
+                Margin = new Thickness(3),
+                Background = field,
+                Foreground = ink,
+                BorderThickness = new Thickness(0),
+                Cursor = Cursors.Hand
+            };
+            removeButton.Click += (_, _) => remove();
+
+            actions.Children.Add(editButton);
+            actions.Children.Add(removeButton);
+            DockPanel.SetDock(actions, Dock.Right);
+            row.Children.Add(actions);
+
+            var details = new StackPanel
+            {
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(4, 5, 8, 5)
+            };
+
+            details.Children.Add(new TextBlock
+            {
+                Text = title,
+                Foreground = ink,
+                FontSize = 12,
+                FontWeight = FontWeights.SemiBold
+            });
+
+            details.Children.Add(new TextBlock
+            {
+                Text = url,
+                Foreground = muted,
+                FontSize = 10,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            });
+
+            row.Children.Add(details);
+
+            return new Border
+            {
+                Child = row,
+                Background = card,
+                BorderBrush = outline,
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(7),
+                Padding = new Thickness(5)
+            };
+        }
+
+        void RenderSavedLinks()
+        {
+            savedLinksPanel.Children.Clear();
+
+            savedLinksPanel.Children.Add(SettingLabel("BOOKMARKS", muted));
+
+            if (preferences.Bookmarks.Count == 0)
+            {
+                savedLinksPanel.Children.Add(new TextBlock
+                {
+                    Text = "No bookmarks saved yet.",
+                    Foreground = muted
+                });
+            }
+
+            foreach (var bookmark in preferences.Bookmarks.ToList())
+            {
+                savedLinksPanel.Children.Add(CreateLinkRow(
+                    bookmark.Title,
+                    bookmark.Url,
+                    () => EditSavedLink(bookmark.Title, bookmark.Url, (newTitle, newUrl) =>
+                    {
+                        bookmark.Title = newTitle;
+                        bookmark.Url = newUrl;
+                        SavePreferences();
+                        RenderBookmarks();
+                        UpdateBookmarkButton();
+                        RenderSavedLinks();
+                    }),
+                    () =>
+                    {
+                        if (MessageBox.Show(dialog,
+                            $"Remove bookmark '{bookmark.Title}'?",
+                            "Remove bookmark",
+                            MessageBoxButton.YesNo,
+                            MessageBoxImage.Question) != MessageBoxResult.Yes)
+                            return;
+
+                        preferences.Bookmarks.Remove(bookmark);
+                        SavePreferences();
+                        RenderBookmarks();
+                        UpdateBookmarkButton();
+                        RenderSavedLinks();
+                    }));
+            }
+
+            savedLinksPanel.Children.Add(SettingLabel("SHORTCUTS", muted));
+
+            if (preferences.Shortcuts.Count == 0)
+            {
+                savedLinksPanel.Children.Add(new TextBlock
+                {
+                    Text = "No shortcuts saved yet.",
+                    Foreground = muted
+                });
+            }
+
+            foreach (var shortcut in preferences.Shortcuts.ToList())
+            {
+                savedLinksPanel.Children.Add(CreateLinkRow(
+                    shortcut.Title,
+                    shortcut.Url,
+                    () => EditSavedLink(shortcut.Title, shortcut.Url, (newTitle, newUrl) =>
+                    {
+                        shortcut.Title = newTitle;
+                        shortcut.Url = newUrl;
+                        SavePreferences();
+                        RenderShortcuts();
+                        RenderSavedLinks();
+                    }),
+                    () =>
+                    {
+                        if (MessageBox.Show(dialog,
+                            $"Remove shortcut '{shortcut.Title}'?",
+                            "Remove shortcut",
+                            MessageBoxButton.YesNo,
+                            MessageBoxImage.Question) != MessageBoxResult.Yes)
+                            return;
+
+                        preferences.Shortcuts.Remove(shortcut);
+                        SavePreferences();
+                        RenderShortcuts();
+                        RenderSavedLinks();
+                    }));
+            }
+        }
+
+        RenderSavedLinks();
+
+        shortcutsContent.Children.Add(SettingsCard(
+            "Shortcuts and bookmarks",
+            "Manage your saved websites.",
+            new UIElement[] { savedLinksPanel },
+            card, outline, ink, muted));
+
+        var vaultStatus = new TextBlock
+        {
+            Foreground = muted,
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 5, 0, 10)
+        };
+
+        var masterPasswordBox = new PasswordBox
+        {
+            Padding = new Thickness(10),
+            Background = field,
+            Foreground = ink,
+            BorderBrush = outline,
+            BorderThickness = new Thickness(1)
+        };
+
+        var masterPasswordLabel = SettingLabel("MASTER PASSWORD", muted);
+        var savedPasswordLabel = SettingLabel("SAVED PASSWORDS", muted);
+
+        var passwordSearchBox = new TextBox
+        {
+            Height = 36,
+            Padding = new Thickness(10, 6, 10, 6),
+            FontSize = 14,
+            Background = card,
+            Foreground = ink,
+            BorderBrush = outline
+        };
+
+        var passwordListPanel = new StackPanel
+        {
+            Orientation = Orientation.Vertical
+        };
+
+        var addPasswordButton = new Button
+        {
+            Content = "+ Add Password",
+            Height = 38,
+            Padding = new Thickness(14, 0, 14, 0),
+            Background = accent,
+            Foreground = Brushes.White,
+            BorderThickness = new Thickness(0),
+            Cursor = Cursors.Hand
+        };
+
+        var unlockButton = new Button
+        {
+            Content = passwordVault.VaultExists() ? "Unlock vault" : "Create vault",
+            Padding = new Thickness(13, 9, 13, 9),
+            Background = accent,
+            Foreground = light ? Brushes.White : Brushes.Black,
+            BorderThickness = new Thickness(0),
+            FontWeight = FontWeights.SemiBold,
+            HorizontalAlignment = HorizontalAlignment.Left
+        };
+
+        var lockButton = new Button
+        {
+            Content = "Lock vault",
+            Padding = new Thickness(13, 9, 13, 9),
+            Background = field,
+            Foreground = ink,
+            BorderBrush = outline,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            Visibility = Visibility.Collapsed
+        };
+
+        passwordSearchBox.TextChanged += (_, _) => RefreshPasswordList();
+
+        addPasswordButton.Click += (_, _) =>
+        {
+            if (!passwordVault.IsUnlocked)
+                return;
+
+            ShowAddPasswordDialog();
+        };
+
+        void UpdateVaultInterface()
+        {
+            if (passwordVault.IsUnlocked)
+            {
+                unlockButton.IsEnabled = false;
+                unlockButton.Visibility = Visibility.Collapsed;
+                lockButton.Visibility = Visibility.Visible;
+                masterPasswordBox.Visibility = Visibility.Collapsed;
+                masterPasswordLabel.Visibility = Visibility.Collapsed;
+                savedPasswordLabel.Visibility = Visibility.Visible;
+                passwordSearchBox.Visibility = Visibility.Visible;
+                addPasswordButton.Visibility = Visibility.Visible;
+                RefreshPasswordList();
+            }
+            else
+            {
+                vaultStatus.Text = passwordVault.VaultExists()
+                    ? "Vault is locked."
+                    : "No vault created yet.";
+
+                unlockButton.Content = passwordVault.VaultExists()
+                    ? "Unlock vault"
+                    : "Create vault";
+
+                unlockButton.IsEnabled = true;
+                unlockButton.Visibility = Visibility.Visible;
+                lockButton.Visibility = Visibility.Collapsed;
+                masterPasswordBox.Visibility = Visibility.Visible;
+                masterPasswordLabel.Visibility = Visibility.Visible;
+                savedPasswordLabel.Visibility = Visibility.Collapsed;
+                passwordSearchBox.Visibility = Visibility.Collapsed;
+                addPasswordButton.Visibility = Visibility.Collapsed;
+                RefreshPasswordList();
+            }
+        }
+
+        void RefreshPasswordList()
+        {
+            passwordListPanel.Children.Clear();
+
+            if (!passwordVault.IsUnlocked)
+                return;
+
+            string search = passwordSearchBox.Text.Trim();
+
+            var entries = passwordVault.GetEntries()
+                .Where(e =>
+                    e.Website.Contains(search, StringComparison.OrdinalIgnoreCase) ||
+                    e.Username.Contains(search, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(e => e.Website)
+                .ToList();
+
+            foreach (var entry in entries)
+            {
+                var entryPanel = new Border
+                {
+                    Padding = new Thickness(12),
+                    Margin = new Thickness(0, 0, 0, 8),
+                    Background = card,
+                    BorderBrush = outline,
+                    BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(8)
+                };
+
+                var row = new DockPanel();
+
+                var actions = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+
+                var editButton = new Button
+                {
+                    Content = "Edit",
+                    Padding = new Thickness(10, 6, 10, 6),
+                    Background = field,
+                    Foreground = ink,
+                    BorderBrush = outline,
+                    Margin = new Thickness(4, 0, 0, 0)
+                };
+
+                var deleteButton = new Button
+                {
+                    Content = "Delete",
+                    Padding = new Thickness(10, 6, 10, 6),
+                    Background = field,
+                    Foreground = Brushes.IndianRed,
+                    BorderBrush = outline,
+                    Margin = new Thickness(4, 0, 0, 0)
+                };
+
+                editButton.Click += (_, _) => ShowEditPasswordDialog(entry);
+
+                deleteButton.Click += (_, _) =>
+                {
+                    var result = MessageBox.Show(
+                        $"Are you sure you want to delete the login for {entry.Website}?",
+                        "Delete Password",
+                        MessageBoxButton.YesNo,
+                        MessageBoxImage.Warning);
+
+                    if (result != MessageBoxResult.Yes)
+                        return;
+
+                    try
+                    {
+                        passwordVault.DeleteEntry(entry.Id);
+                        RefreshPasswordList();
+                        UpdateVaultInterface();
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show("Could not delete password:\n\n" + ex.Message);
+                    }
+                };
+
+                actions.Children.Add(editButton);
+                actions.Children.Add(deleteButton);
+
+                DockPanel.SetDock(actions, Dock.Right);
+                row.Children.Add(actions);
+
+                var details = new StackPanel
+                {
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+
+                details.Children.Add(new TextBlock
+                {
+                    Text = entry.Website,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = ink,
+                    FontSize = 14
+                });
+
+                details.Children.Add(new TextBlock
+                {
+                    Text = entry.Username,
+                    Foreground = muted,
+                    FontSize = 12,
+                    Margin = new Thickness(0, 4, 0, 0)
+                });
+
+                row.Children.Add(details);
+
+                entryPanel.Child = row;
+                passwordListPanel.Children.Add(entryPanel);
+            }
+        }
+
+        void ShowAddPasswordDialog()
+        {
+            var entryDialog = new Window
+            {
+                Title = "Add Password",
+                Owner = dialog,
+                Width = 430,
+                Height = 560,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Background = bg,
+                Foreground = ink,
+                ResizeMode = ResizeMode.NoResize
+            };
+
+            var panel = new StackPanel
+            {
+                Margin = new Thickness(22)
+            };
+
+            TextBlock MakeLabel(string text)
+            {
+                return new TextBlock
+                {
+                    Text = text,
+                    Foreground = muted,
+                    FontSize = 11,
+                    FontWeight = FontWeights.SemiBold,
+                    Margin = new Thickness(0, 12, 0, 5)
+                };
+            }
+
+            TextBox MakeInput()
+            {
+                return new TextBox
+                {
+                    Padding = new Thickness(10),
+                    Background = field,
+                    Foreground = ink,
+                    BorderBrush = outline,
+                    BorderThickness = new Thickness(1),
+                    FontSize = 13
+                };
+            }
+
+            var websiteBox = MakeInput();
+            var usernameBox = MakeInput();
+
+            var passwordBox = new PasswordBox
+            {
+                Padding = new Thickness(10),
+                Background = field,
+                Foreground = ink,
+                BorderBrush = outline,
+                BorderThickness = new Thickness(1),
+                FontSize = 13
+            };
+
+            var notesBox = new TextBox
+            {
+                Padding = new Thickness(10),
+                Background = field,
+                Foreground = ink,
+                BorderBrush = outline,
+                BorderThickness = new Thickness(1),
+                FontSize = 13,
+                Height = 85,
+                AcceptsReturn = true,
+                TextWrapping = TextWrapping.Wrap,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+            };
+
+            panel.Children.Add(new TextBlock
+            {
+                Text = "Save a new login",
+                FontSize = 21,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = ink
+            });
+
+            panel.Children.Add(MakeLabel("WEBSITE"));
+            panel.Children.Add(websiteBox);
+
+            panel.Children.Add(MakeLabel("USERNAME / EMAIL"));
+            panel.Children.Add(usernameBox);
+
+            panel.Children.Add(MakeLabel("PASSWORD"));
+            panel.Children.Add(passwordBox);
+
+            panel.Children.Add(MakeLabel("NOTES"));
+            panel.Children.Add(notesBox);
+
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 20, 0, 0)
+            };
+
+            var cancelButton = new Button
+            {
+                Content = "Cancel",
+                Padding = new Thickness(15, 8, 15, 8),
+                Background = field,
+                Foreground = ink,
+                BorderBrush = outline,
+                Margin = new Thickness(0, 0, 8, 0)
+            };
+
+            var saveButton = new Button
+            {
+                Content = "Save Password",
+                Padding = new Thickness(15, 8, 15, 8),
+                Background = accent,
+                Foreground = light ? Brushes.White : Brushes.Black,
+                BorderThickness = new Thickness(0),
+                FontWeight = FontWeights.SemiBold,
+                IsDefault = true
+            };
+
+            cancelButton.Click += (_, _) => entryDialog.Close();
+
+            saveButton.Click += (_, _) =>
+            {
+                string website = websiteBox.Text.Trim();
+                string username = usernameBox.Text.Trim();
+                string password = passwordBox.Password;
+
+                if (string.IsNullOrWhiteSpace(website) ||
+                    string.IsNullOrWhiteSpace(username) ||
+                    string.IsNullOrEmpty(password))
+                {
+                    MessageBox.Show(
+                        "Website, username and password are required.",
+                        "Password Manager",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    return;
+                }
+
+                // Add HTTPS if the user didn't specify a scheme.
+                if (!website.Contains("://"))
+                    website = "https://" + website;
+
+                if (!Uri.TryCreate(website, UriKind.Absolute, out var uri) ||
+                    (uri.Scheme != Uri.UriSchemeHttps &&
+                     uri.Scheme != Uri.UriSchemeHttp))
+                {
+                    MessageBox.Show(
+                        "Please enter a valid website address.",
+                        "Password Manager",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    return;
+                }
+
+                // Store only the origin, not the page path or query.
+                string origin = uri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
+
+                try
+                {
+                    passwordVault.AddEntry(new VaultEntry
+                    {
+                        Website = origin,
+                        Username = username,
+                        Password = password,
+                        Notes = notesBox.Text.Trim()
+                    });
+
+                    RefreshPasswordList();
+                    UpdateVaultInterface();
+                    entryDialog.Close();
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(
+                        "Could not save password:\n\n" + ex.Message,
+                        "Password Manager",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Error);
+                }
+            };
+
+            buttons.Children.Add(cancelButton);
+            buttons.Children.Add(saveButton);
+            panel.Children.Add(buttons);
+
+            entryDialog.Content = panel;
+            entryDialog.Loaded += (_, _) => websiteBox.Focus();
+            entryDialog.ShowDialog();
+        }
+
+        void ShowEditPasswordDialog(VaultEntry entry)
+        {
+            var editDialog = new Window
+            {
+                Title = "Edit Password",
+                Owner = dialog,
+                Width = 430,
+                Height = 560,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Background = bg,
+                Foreground = ink,
+                ResizeMode = ResizeMode.NoResize
+            };
+
+            var panel = new StackPanel { Margin = new Thickness(22) };
+
+            TextBlock MakeLabel(string text)
+            {
+                return new TextBlock
+                {
+                    Text = text,
+                    Foreground = muted,
+                    FontSize = 11,
+                    FontWeight = FontWeights.SemiBold,
+                    Margin = new Thickness(0, 12, 0, 5)
+                };
+            }
+
+            TextBox MakeInput(string value)
+            {
+                return new TextBox
+                {
+                    Text = value,
+                    Padding = new Thickness(10),
+                    Background = field,
+                    Foreground = ink,
+                    BorderBrush = outline,
+                    BorderThickness = new Thickness(1),
+                    FontSize = 13
+                };
+            }
+
+            var websiteBox = MakeInput(entry.Website);
+            var usernameBox = MakeInput(entry.Username);
+
+            var passwordBox = new PasswordBox
+            {
+                Password = entry.Password,
+                Padding = new Thickness(10),
+                Background = field,
+                Foreground = ink,
+                BorderBrush = outline,
+                BorderThickness = new Thickness(1),
+                FontSize = 13
+            };
+
+            var notesBox = new TextBox
+            {
+                Text = entry.Notes,
+                Padding = new Thickness(10),
+                Background = field,
+                Foreground = ink,
+                BorderBrush = outline,
+                BorderThickness = new Thickness(1),
+                FontSize = 13,
+                Height = 85,
+                AcceptsReturn = true,
+                TextWrapping = TextWrapping.Wrap
+            };
+
+            panel.Children.Add(new TextBlock
+            {
+                Text = "Edit saved login",
+                FontSize = 21,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = ink
+            });
+
+            panel.Children.Add(MakeLabel("WEBSITE"));
+            panel.Children.Add(websiteBox);
+
+            panel.Children.Add(MakeLabel("USERNAME / EMAIL"));
+            panel.Children.Add(usernameBox);
+
+            panel.Children.Add(MakeLabel("PASSWORD"));
+            panel.Children.Add(passwordBox);
+
+            panel.Children.Add(MakeLabel("NOTES"));
+            panel.Children.Add(notesBox);
+
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 20, 0, 0)
+            };
+
+            var cancelButton = new Button
+            {
+                Content = "Cancel",
+                Padding = new Thickness(15, 8, 15, 8),
+                Background = field,
+                Foreground = ink,
+                BorderBrush = outline,
+                Margin = new Thickness(0, 0, 8, 0)
+            };
+
+            var saveButton = new Button
+            {
+                Content = "Save Changes",
+                Padding = new Thickness(15, 8, 15, 8),
+                Background = accent,
+                Foreground = light ? Brushes.White : Brushes.Black,
+                BorderThickness = new Thickness(0),
+                FontWeight = FontWeights.SemiBold,
+                IsDefault = true
+            };
+
+            cancelButton.Click += (_, _) => editDialog.Close();
+
+            saveButton.Click += (_, _) =>
+            {
+                string website = websiteBox.Text.Trim();
+                string username = usernameBox.Text.Trim();
+                string password = passwordBox.Password;
+
+                if (string.IsNullOrWhiteSpace(website) ||
+                    string.IsNullOrWhiteSpace(username) ||
+                    string.IsNullOrEmpty(password))
+                {
+                    MessageBox.Show("Website, username and password are required.");
+                    return;
+                }
+
+                if (!website.Contains("://"))
+                    website = "https://" + website;
+
+                if (!Uri.TryCreate(website, UriKind.Absolute, out var uri) ||
+                    (uri.Scheme != Uri.UriSchemeHttps &&
+                     uri.Scheme != Uri.UriSchemeHttp))
+                {
+                    MessageBox.Show("Please enter a valid website address.");
+                    return;
+                }
+
+                string origin = uri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
+
+                try
+                {
+                    passwordVault.UpdateEntry(new VaultEntry
+                    {
+                        Id = entry.Id,
+                        Website = origin,
+                        Username = username,
+                        Password = password,
+                        Notes = notesBox.Text.Trim(),
+                        CreatedAt = entry.CreatedAt
+                    });
+
+                    RefreshPasswordList();
+                    UpdateVaultInterface();
+                    editDialog.Close();
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Could not update password:\n\n" + ex.Message);
+                }
+            };
+
+            buttons.Children.Add(cancelButton);
+            buttons.Children.Add(saveButton);
+            panel.Children.Add(buttons);
+
+            editDialog.Content = panel;
+            editDialog.ShowDialog();
+        }
+
+        unlockButton.Click += (_, _) =>
+        {
+            string password = masterPasswordBox.Password;
+
+            try
+            {
+                if (passwordVault.VaultExists())
+                {
+                    passwordVault.Unlock(password);
+                }
+                else
+                {
+                    passwordVault.CreateVault(password);
+                }
+
+                masterPasswordBox.Clear();
+                UpdateVaultInterface();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    ex.Message,
+                    "Password Manager",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+        };
+
+        lockButton.Click += (_, _) =>
+        {
+            passwordVault.Lock();
+            masterPasswordBox.Clear();
+            UpdateVaultInterface();
+        };
+
+        UpdateVaultInterface();
+
+        passwordContent.Children.Add(SettingsCard(
+            "Password Manager",
+            "Your passwords are encrypted and stored locally on this device.",
+            new UIElement[]
+            {
+                vaultStatus,
+                masterPasswordLabel,
+                masterPasswordBox,
+                unlockButton,
+                lockButton,
+                savedPasswordLabel,
+                passwordSearchBox,
+                addPasswordButton,
+                passwordListPanel
+            },
+            card, outline, ink, muted));
+        // Main settings area
+        var settingsArea = new Grid
+        {
+            Margin = new Thickness(22, 0, 22, 10)
+        };
+
+        settingsArea.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = new GridLength(165) });
+
+        settingsArea.ColumnDefinitions.Add(
+            new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        // Sidebar
+        var sidebar = new StackPanel
+        {
+            Margin = new Thickness(0, 0, 15, 0)
+        };
+
+        var pageHost = new ScrollViewer
+        {
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto
+        };
+
+        Grid.SetColumn(pageHost, 1);
+
+        settingsArea.Children.Add(sidebar);
+        settingsArea.Children.Add(pageHost);
+
+        Button MakeCategoryButton(string title)
+        {
+            var button = new Button
+            {
+                Content = title,
+                Padding = new Thickness(12, 11, 12, 11),
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                Background = Brushes.Transparent,
+                Foreground = ink,
+                BorderThickness = new Thickness(0),
+                FontSize = 12,
+                Cursor = Cursors.Hand,
+                Margin = new Thickness(0, 0, 0, 4)
+            };
+
+            return button;
+        }
+
+        var appearanceButton = MakeCategoryButton("Appearance");
+        var startPageButton = MakeCategoryButton("Start page");
+        var shortcutsButton = MakeCategoryButton("Shortcuts & Bookmarks");
+        var passwordButton = MakeCategoryButton("Password Manager");
+
+        sidebar.Children.Add(appearanceButton);
+        sidebar.Children.Add(startPageButton);
+        sidebar.Children.Add(shortcutsButton);
+        sidebar.Children.Add(new Border
+        {
+            Height = 1,
+            Background = outline,
+            Margin = new Thickness(5, 10, 5, 10)
+        });
+        sidebar.Children.Add(passwordButton);
+
+        void ShowCategory(string category)
+        {
+            pageHost.Content = category switch
+            {
+                "Start page" => startPageContent,
+                "Shortcuts" => shortcutsContent,
+                "Password Manager" => passwordContent,
+                _ => appearanceContent
+            };
+
+            foreach (var button in new[]
+            {
+        appearanceButton,
+        startPageButton,
+        shortcutsButton,
+        passwordButton
+    })
+            {
+                bool selected = button.Tag?.ToString() == category;
+
+                button.Background = selected
+                    ? accent
+                    : Brushes.Transparent;
+
+                button.Foreground = selected
+                    ? (light ? Brushes.White : Brushes.Black)
+                    : ink;
+
+                button.FontWeight = selected
+                    ? FontWeights.SemiBold
+                    : FontWeights.Normal;
+            }
+        }
+
+        appearanceButton.Tag = "Appearance";
+        startPageButton.Tag = "Start page";
+        shortcutsButton.Tag = "Shortcuts";
+        passwordButton.Tag = "Password Manager";
+
+        appearanceButton.Click += (_, _) => ShowCategory("Appearance");
+        startPageButton.Click += (_, _) => ShowCategory("Start page");
+        shortcutsButton.Click += (_, _) => ShowCategory("Shortcuts");
+        passwordButton.Click += (_, _) => ShowCategory("Password Manager");
+
+        ShowCategory("Appearance");
+
+        Grid.SetRow(settingsArea, 1);
+        layout.Children.Add(settingsArea);
 
         var footer = new DockPanel { Margin = new Thickness(22, 12, 22, 18), LastChildFill = false };
         var savedStatus = new TextBlock { Text = "", Foreground = muted, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 12, 0) };

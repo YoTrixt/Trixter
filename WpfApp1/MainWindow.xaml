@@ -34,8 +34,49 @@
     </Setter.Value>
    </Setter>
   </Style>
-  <Style TargetType="Button" x:Key="ChromeButton"><Setter Property="Foreground" Value="#C9CCD4"/><Setter Property="Background" Value="Transparent"/><Setter Property="BorderThickness" Value="0"/><Setter Property="Padding" Value="10,7"/><Setter Property="FontSize" Value="13"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button"><Border x:Name="ButtonBorder" Background="{TemplateBinding Background}" CornerRadius="7" Padding="{TemplateBinding Padding}" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform><ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/></Border><ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True"><Setter TargetName="ButtonBorder" Property="Background" Value="{DynamicResource HoverSurface}"/><Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="ButtonBorder" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.06" Duration="0:0:0.12"/><DoubleAnimation Storyboard.TargetName="ButtonBorder" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.06" Duration="0:0:0.12"/></Storyboard></BeginStoryboard></Trigger.EnterActions><Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="ButtonBorder" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.16"/><DoubleAnimation Storyboard.TargetName="ButtonBorder" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.16"/></Storyboard></BeginStoryboard></Trigger.ExitActions></Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter></Style>
-  <Style TargetType="Button" x:Key="TabTitleButton" BasedOn="{StaticResource ChromeButton}"><Setter Property="FontSize" Value="12"/><Setter Property="Padding" Value="12,7,5,7"/><Setter Property="MinWidth" Value="100"/><Setter Property="MaxWidth" Value="190"/></Style>
+        <Style TargetType="Button" x:Key="ChromeButton">
+            <Setter Property="Foreground" Value="#C9CCD4"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="10,7"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="ButtonBorder"
+                        Background="{TemplateBinding Background}"
+                        CornerRadius="7"
+                        Padding="{TemplateBinding Padding}">
+                            <ContentPresenter
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Center"/>
+                        </Border>
+
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="ButtonBorder"
+                                Property="Background"
+                                Value="{DynamicResource HoverSurface}"/>
+                            </Trigger>
+
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="ButtonBorder"
+                                Property="Opacity"
+                                Value="0.75"/>
+                            </Trigger>
+
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="ButtonBorder"
+                                Property="Opacity"
+                                Value="0.4"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="Button" x:Key="TabTitleButton" BasedOn="{StaticResource ChromeButton}"><Setter Property="FontSize" Value="12"/><Setter Property="Padding" Value="12,7,5,7"/><Setter Property="MinWidth" Value="100"/><Setter Property="MaxWidth" Value="190"/></Style>
  </Window.Resources>
  <Grid><Grid.RowDefinitions><RowDefinition Height="42"/><RowDefinition Height="48"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
   <Border x:Name="TitleBar" Grid.Row="0" Background="#171A21" BorderBrush="#292D36" BorderThickness="0,0,0,1" shell:WindowChrome.IsHitTestVisibleInChrome="True" PreviewMouseLeftButtonDown="TitleBar_MouseLeftButtonDown"><DockPanel><StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center" Margin="4,0,8,0"><Button ToolTip="Minimize" Style="{StaticResource ChromeButton}" Click="Minimize_Click"><Path Data="M 3,10 L 15,10" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.7" Width="18" Height="18"/></Button><Button x:Name="MaximizeButton" ToolTip="Maximize or restore" Style="{StaticResource ChromeButton}" Click="Maximize_Click"><Path x:Name="MaximizeIcon" Data="M 3,3 L 15,3 L 15,15 L 3,15 Z" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.4" Width="18" Height="18"/></Button><Button ToolTip="Close Trixter" Style="{StaticResource ChromeButton}" Click="Close_Click"><Path Data="M 4,4 L 14,14 M 14,4 L 4,14" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" StrokeThickness="1.8" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Width="18" Height="18"/></Button></StackPanel><TextBlock x:Name="BrandLabel" Text="TRIXTER" Foreground="#B6F36A" FontSize="12" FontWeight="Bold" VerticalAlignment="Center" Margin="16,0,12,0"/><Button Content="+" ToolTip="New tab" Style="{StaticResource ChromeButton}" Click="NewTab_Click"/><ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled"><StackPanel x:Name="TabStrip" Orientation="Horizontal"/></ScrollViewer></DockPanel></Border>
