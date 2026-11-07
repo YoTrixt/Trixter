@@ -18,6 +18,10 @@ namespace WpfApp1;
 public partial class MainWindow : Window
 {
     const int WmGetMinMaxInfo = 0x0024;
+    const int WmNcHitTest = 0x0084;
+    const int WmLButtonDown = 0x0201;
+    const int WmLButtonUp = 0x0202;
+    const int HtClient = 1;
     const uint MonitorDefaultToNearest = 2;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -50,6 +54,9 @@ public partial class MainWindow : Window
 
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     static extern bool GetMonitorInfo(IntPtr monitor, ref NativeMonitorInfo info);
+
+    [DllImport("user32.dll")]
+    static extern bool GetClientRect(IntPtr hwnd, out NativeRect rect);
 
     static readonly object browserEnvironmentLock = new();
     static Task<CoreWebView2Environment>? browserEnvironmentTask;
@@ -97,6 +104,7 @@ public partial class MainWindow : Window
     }
     private VaultService passwordVault = new();
     private Popup? passwordAccountPopup;
+    private bool closeCornerPressed;
     sealed class Preferences
     {
         public string Accent { get; set; } = "#B6F36A";
@@ -152,14 +160,34 @@ public partial class MainWindow : Window
         InitializeComponent();
         maximizeIcon = (Path)FindName("MaximizeIcon");
         this.privateMode = privateMode;
+        Closing += (_, _) =>
+        {
+            // A window can close while it still owns tabs. Release every WebView2
+            // before WPF tears down the window and its hosted native windows.
+            if (passwordAccountPopup != null)
+            {
+                passwordAccountPopup.IsOpen = false;
+                passwordAccountPopup = null;
+            }
+
+            foreach (var openTab in tabs.ToList())
+            {
+                TabStrip.Children.Remove(openTab.Surface);
+                BrowserHost.Children.Remove(openTab.View);
+                openTab.View.Dispose();
+            }
+
+            tabs.Clear();
+            activeTab = null;
+        };
         SourceInitialized += (_, _) => HwndSource.FromHwnd(new WindowInteropHelper(this).Handle)?.AddHook(WindowMessageHook);
         StateChanged += (_, _) =>
         {
             var chrome = WindowChrome.GetWindowChrome(this);
             if (chrome != null)
                 chrome.ResizeBorderThickness = WindowState == WindowState.Maximized
-                    ? new Thickness(6, 0, 6, 6)
-                    : new Thickness(6);
+                    ? new Thickness(10, 0, 10, 10)
+                    : new Thickness(10);
             if (maximizeIcon != null)
                 maximizeIcon.Data = WindowState == WindowState.Maximized
                     ? Geometry.Parse("M 5,5 L 16,5 L 16,16 L 5,16 Z M 2,12 L 2,2 L 12,2")
@@ -1103,6 +1131,16 @@ public partial class MainWindow : Window
         tabs.RemoveAt(oldIndex);
         TabStrip.Children.Remove(tab.Surface);
         BrowserHost.Children.Remove(tab.View);
+
+        // Removing a WPF control from the visual tree does not release its
+        // WebView2 browser/controller resources. Dispose it explicitly.
+        if (passwordAccountPopup?.PlacementTarget == tab.View)
+        {
+            passwordAccountPopup.IsOpen = false;
+            passwordAccountPopup = null;
+        }
+        tab.View.Dispose();
+
         if (tabs.Count == 0)
         {
             activeTab = null;
@@ -1140,6 +1178,14 @@ public partial class MainWindow : Window
         UpdateBookmarkButton();
         NewTabPanel.Visibility = string.IsNullOrEmpty(tab.Url) ? Visibility.Visible : Visibility.Collapsed;
         BrowserHost.Visibility = string.IsNullOrEmpty(tab.Url) ? Visibility.Collapsed : Visibility.Visible;
+        if (string.IsNullOrEmpty(tab.Url))
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                AddressBox.Focus();
+                Keyboard.Focus(AddressBox);
+            }, System.Windows.Threading.DispatcherPriority.Input);
+        }
     }
 
     static string Host(string url)
@@ -2883,19 +2929,88 @@ public partial class MainWindow : Window
 
     IntPtr WindowMessageHook(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
+        if (WindowState == WindowState.Maximized)
+        {
+            if (message == WmNcHitTest)
+            {
+                // Keep the top-right screen corner in our client area. Returning
+                // HTCLOSE here would make Windows draw its own caption button.
+                int screenX = unchecked((short)(lParam.ToInt64() & 0xFFFF));
+                int screenY = unchecked((short)((lParam.ToInt64() >> 16) & 0xFFFF));
+                IntPtr monitor = MonitorFromWindow(hwnd, MonitorDefaultToNearest);
+                var monitorInfo = new NativeMonitorInfo { Size = Marshal.SizeOf<NativeMonitorInfo>() };
+
+                if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref monitorInfo))
+                {
+                    var dpi = VisualTreeHelper.GetDpi(this);
+                    int closeWidth = (int)Math.Ceiling(46 * dpi.DpiScaleX);
+                    int closeHeight = (int)Math.Ceiling(32 * dpi.DpiScaleY);
+                    bool inTopRightCorner =
+                        screenX >= monitorInfo.Monitor.Right - closeWidth &&
+                        screenX < monitorInfo.Monitor.Right &&
+                        screenY >= monitorInfo.Monitor.Top &&
+                        screenY < monitorInfo.Monitor.Top + closeHeight;
+
+                    if (inTopRightCorner)
+                    {
+                        handled = true;
+                        return new IntPtr(HtClient);
+                    }
+                }
+            }
+            else if (message == WmLButtonDown)
+            {
+                int x = unchecked((short)(lParam.ToInt64() & 0xFFFF));
+                int y = unchecked((short)((lParam.ToInt64() >> 16) & 0xFFFF));
+                if (IsInCloseCorner(hwnd, x, y))
+                {
+                    closeCornerPressed = true;
+                    handled = true;
+                    return IntPtr.Zero;
+                }
+            }
+            else if (message == WmLButtonUp && closeCornerPressed)
+            {
+                closeCornerPressed = false;
+                int x = unchecked((short)(lParam.ToInt64() & 0xFFFF));
+                int y = unchecked((short)((lParam.ToInt64() >> 16) & 0xFFFF));
+                handled = true;
+                if (IsInCloseCorner(hwnd, x, y))
+                    Close_Click(this, new RoutedEventArgs());
+                return IntPtr.Zero;
+            }
+        }
+        else
+        {
+            closeCornerPressed = false;
+        }
+
         if (message != WmGetMinMaxInfo) return IntPtr.Zero;
-        IntPtr monitor = MonitorFromWindow(hwnd, MonitorDefaultToNearest);
-        var monitorInfo = new NativeMonitorInfo { Size = Marshal.SizeOf<NativeMonitorInfo>() };
-        if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref monitorInfo)) return IntPtr.Zero;
+        IntPtr workAreaMonitor = MonitorFromWindow(hwnd, MonitorDefaultToNearest);
+        var workAreaInfo = new NativeMonitorInfo { Size = Marshal.SizeOf<NativeMonitorInfo>() };
+        if (workAreaMonitor == IntPtr.Zero || !GetMonitorInfo(workAreaMonitor, ref workAreaInfo)) return IntPtr.Zero;
 
         var limits = Marshal.PtrToStructure<NativeMinMaxInfo>(lParam);
-        limits.MaxPosition.X = monitorInfo.Work.Left - monitorInfo.Monitor.Left;
-        limits.MaxPosition.Y = monitorInfo.Work.Top - monitorInfo.Monitor.Top;
-        limits.MaxSize.X = monitorInfo.Work.Right - monitorInfo.Work.Left;
-        limits.MaxSize.Y = monitorInfo.Work.Bottom - monitorInfo.Work.Top;
+        limits.MaxPosition.X = workAreaInfo.Work.Left - workAreaInfo.Monitor.Left;
+        limits.MaxPosition.Y = workAreaInfo.Work.Top - workAreaInfo.Monitor.Top;
+        limits.MaxSize.X = workAreaInfo.Work.Right - workAreaInfo.Work.Left;
+        limits.MaxSize.Y = workAreaInfo.Work.Bottom - workAreaInfo.Work.Top;
+        var dpiForLimits = VisualTreeHelper.GetDpi(this);
+        limits.MinTrackSize.X = (int)Math.Ceiling(MinWidth * dpiForLimits.DpiScaleX);
+        limits.MinTrackSize.Y = (int)Math.Ceiling(MinHeight * dpiForLimits.DpiScaleY);
         Marshal.StructureToPtr(limits, lParam, false);
         handled = true;
         return IntPtr.Zero;
+    }
+
+    bool IsInCloseCorner(IntPtr hwnd, int x, int y)
+    {
+        if (!GetClientRect(hwnd, out var clientRect)) return false;
+        var dpi = VisualTreeHelper.GetDpi(this);
+        int closeWidth = (int)Math.Ceiling(46 * dpi.DpiScaleX);
+        int closeHeight = (int)Math.Ceiling(32 * dpi.DpiScaleY);
+        return x >= clientRect.Right - closeWidth && x < clientRect.Right &&
+               y >= clientRect.Top && y < clientRect.Top + closeHeight;
     }
 
     void Minimize_Click(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
